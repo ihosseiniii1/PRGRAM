@@ -87,20 +87,21 @@ set_env() { # set_env KEY VALUE  (safe for values containing | & \)
   fi
 }
 
-prompt() { # prompt VAR "text" [secret]
+prompt() { # prompt VAR "text"   (input is visible; whitespace, CR and quotes are stripped)
   local __var=$1 __txt=$2 __v=""
-  if [[ "${3:-}" == secret ]]; then read -rsp "$__txt" __v || true; echo; else read -rp "$__txt" __v || true; fi
+  if ! read -rp "$__txt" __v && [[ -z "$__v" ]]; then echo; die "Input ended (Ctrl+D or no terminal). Re-run interactively, or pass values as environment variables with --yes"; fi
+  __v="$(printf '%s' "$__v" | tr -d '\r' | sed -E "s/^[[:space:]\"']+//; s/[[:space:]\"']+\$//")"
   printf -v "$__var" '%s' "$__v"
 }
 
-prompt_valid() { # prompt_valid VAR "text" REGEX "error message" [secret]   (re-asks until valid)
-  local __var=$1 __txt=$2 __re=$3 __msg=$4 __sec=${5:-} __v=""
+prompt_valid() { # prompt_valid VAR "text" REGEX "error message"   (re-asks until valid)
+  local __pvar=$1 __txt=$2 __re=$3 __msg=$4 __pv=""
   while true; do
-    prompt __v "$__txt" "$__sec"
-    [[ "$__v" =~ $__re ]] && break
+    prompt __pv "$__txt"
+    [[ "$__pv" =~ $__re ]] && break
     warn "$__msg"
   done
-  printf -v "$__var" '%s' "$__v"
+  printf -v "$__pvar" '%s' "$__pv"
 }
 
 public_ip() { curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -4fsS --max-time 6 https://ifconfig.me 2>/dev/null || true; }
@@ -194,21 +195,22 @@ else
   cp "$INSTALL_DIR/.env.example" "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   BOT_TOKEN="${BOT_TOKEN:-}"; OWNER_ID="${OWNER_ID:-}"; API_ID="${API_ID:-}"; API_HASH="${API_HASH:-}"
+  BOT_TOKEN="${BOT_TOKEN//[[:space:]]/}"; OWNER_ID="${OWNER_ID//[[:space:]]/}"; API_ID="${API_ID//[[:space:]]/}"; API_HASH="${API_HASH//[[:space:]]/}"
 
   if (( INTERACTIVE )); then
-    [[ "$BOT_TOKEN" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{30,}$ ]] || \
-      prompt_valid BOT_TOKEN "BOT_TOKEN (from BotFather, input hidden): " '^[0-9]{6,}:[A-Za-z0-9_-]{30,}$' "That does not look like a bot token (expected 123456:ABC...)" secret
+    [[ "$BOT_TOKEN" =~ ^[0-9]{5,}:[A-Za-z0-9_-]{20,}$ ]] || \
+      prompt_valid BOT_TOKEN "BOT_TOKEN (from BotFather): " '^[0-9]{5,}:[A-Za-z0-9_-]{20,}$' "That does not look like a bot token (expected something like 123456789:AAH...; paste only the token, no bot prefix)"
     [[ "$OWNER_ID" =~ ^[0-9]+$ ]] || \
       prompt_valid OWNER_ID "OWNER_ID (your numeric Telegram ID): " '^[0-9]+$' "OWNER_ID must be a number"
     if [[ -z "$API_ID" ]]; then
       prompt_valid API_ID "API_ID from my.telegram.org (empty = shared default, not recommended): " '^[0-9]*$' "API_ID must be a number or empty"
     fi
     if [[ -n "$API_ID" && -z "$API_HASH" ]]; then
-      prompt_valid API_HASH "API_HASH (input hidden): " '^[0-9a-fA-F]{32}$' "API_HASH must be 32 hex characters" secret
+      prompt_valid API_HASH "API_HASH: " '^[0-9a-fA-F]{32}$' "API_HASH must be 32 hex characters"
     fi
   fi
 
-  [[ "$BOT_TOKEN" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{30,}$ ]] || die "BOT_TOKEN is missing or invalid (provide it as an environment variable with --yes)"
+  [[ "$BOT_TOKEN" =~ ^[0-9]{5,}:[A-Za-z0-9_-]{20,}$ ]] || die "BOT_TOKEN is missing or invalid (provide it as an environment variable with --yes)"
   [[ "$OWNER_ID" =~ ^[0-9]+$ ]]                         || die "OWNER_ID is missing or invalid"
   [[ -z "$API_ID" || "$API_ID" =~ ^[0-9]+$ ]]           || die "API_ID must be a number"
   [[ -z "$API_ID" || "$API_HASH" =~ ^[0-9a-fA-F]{32}$ ]] || die "API_HASH is required with API_ID and must be 32 hex characters"
