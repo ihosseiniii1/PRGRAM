@@ -30,6 +30,15 @@ case "${1:-}" in help|-h|--help) usage; exit 0;; esac
 [[ $EUID -eq 0 ]] || { err "Run as root (sudo selfpanel)"; exit 1; }
 dc() { (cd "$DIR" && docker compose "$@"); }
 
+# Docker refuses a CPU limit above the number of cores; keep .env consistent
+ensure_cpu_limit() {
+  local cores cur; cores=$(nproc 2>/dev/null || echo 1); cur=$(grep -E '^CPU_LIMIT=' "$DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')
+  cur=${cur:-1.5}
+  if awk -v l="$cur" -v c="$cores" 'BEGIN{exit !(l+0 > c+0)}'; then
+    envset CPU_LIMIT "$cores"; warn "CPU_LIMIT=$cur exceeds the $cores core(s) here; set to $cores"
+  fi
+}
+
 envget() { grep -E "^$1=" "$DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r'; }
 envset() { # envset KEY VALUE  (safe for values containing | & \)
   local esc; esc="$(printf '%s' "$2" | sed -e 's/[\\|&]/\\&/g')"
@@ -59,6 +68,8 @@ wait_healthy() { # waits up to ~2 minutes for the app container
   done
   return 1
 }
+
+[[ -f "$DIR/.env" ]] && ensure_cpu_limit
 
 # ---------------- status ----------------
 cmd_status() {
@@ -261,6 +272,7 @@ cmd_limits() {
   if [[ -n "$nc" && ! "$nc" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then err "Invalid CPU value"; return 1; fi
   [[ -n "$nm" ]] && envset MEM_LIMIT "$nm"
   [[ -n "$nc" ]] && envset CPU_LIMIT "$nc"
+  ensure_cpu_limit
   dc up -d && ok "Applied"
 }
 

@@ -224,6 +224,14 @@ else
 fi
 chmod 600 "$ENV_FILE"
 
+# ---------- 3.2) cap CPU_LIMIT to the cores this server really has (Docker rejects more) ----------
+cores="$(nproc 2>/dev/null || echo 1)"
+cpu_limit="$(env_get CPU_LIMIT)"; cpu_limit="${cpu_limit:-1.5}"
+if awk -v l="$cpu_limit" -v c="$cores" 'BEGIN{exit !(l+0 > c+0)}'; then
+  set_env CPU_LIMIT "$cores"
+  warn "CPU_LIMIT=$cpu_limit is more than the $cores core(s) on this server; set to $cores"
+fi
+
 # ---------- 3.5) domain + automatic HTTPS ----------
 DOMAIN="${DOMAIN:-$(env_get DOMAIN)}"
 if [[ -z "$DOMAIN" ]] && (( INTERACTIVE )); then
