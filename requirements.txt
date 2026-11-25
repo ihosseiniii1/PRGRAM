@@ -1,0 +1,9 @@
+telethon>=1.36,<2
+python-dotenv>=1.0,<2
+qrcode>=7.4,<9
+pillow>=10.0,<14
+cryptography>=42.0,<50
+# faster Telegram encryption (optional but recommended)
+cryptg>=0.4,<1
+# only needed when USE_PROXY=1 (socks5 / http proxy)
+PySocks>=1.7,<2

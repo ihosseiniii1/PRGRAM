@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# selfpanel - پنل CLI مدیریت PR GRAM Helper
+# منوی تعاملی:  selfpanel     |     دستور مستقیم:  selfpanel status|logs|restart|update|backup|clean|optimize|...
+set -uo pipefail
+
+DIR="${INSTALL_DIR:-/opt/prgram}"
+CT="prgram"
+BK="$DIR/backups"
+
+R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; B=$'\e[1m'; N=$'\e[0m'
+ok()   { echo "${G}✔${N} $*"; }
+warn() { echo "${Y}!${N} $*"; }
+err()  { echo "${R}✖${N} $*" >&2; }
+pause(){ [[ -t 0 && -z "${NOPAUSE:-}" ]] && { echo; read -rp "Enter برای ادامه..." _; }; }
+ask()  { local a; read -rp "$1 [y/N] " a; [[ "$a" =~ ^[Yy]$ ]]; }
+
+[[ -d "$DIR" ]] || { err "مسیر نصب $DIR پیدا نشد"; exit 1; }
+[[ $EUID -eq 0 ]] || { err "با root اجرا کن (sudo selfpanel)"; exit 1; }
+dc() { (cd "$DIR" && docker compose "$@"); }
+
+envget() { grep -E "^$1=" "$DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r'; }
+envset() { # envset KEY VALUE
+  [[ -s "$DIR/.env" && -n "$(tail -c1 "$DIR/.env")" ]] && echo >> "$DIR/.env"
+  if grep -qE "^$1=" "$DIR/.env"; then sed -i "s|^$1=.*|$1=$2|" "$DIR/.env"; else echo "$1=$2" >> "$DIR/.env"; fi
+}
+
+# ---------------- وضعیت ----------------
+cmd_status() {
+  echo "${B}== وضعیت سرویس ==${N}"
+  dc ps
+  local h; h=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' "$CT" 2>/dev/null || echo "-")
+  echo "Health: $h"
+  echo; echo "${B}== منابع کانتینر ==${N}"
+  docker stats --no-stream --format 'CPU {{.CPUPerc}} | RAM {{.MemUsage}} ({{.MemPerc}}) | NET {{.NetIO}}' "$CT" 2>/dev/null || warn "کانتینر در حال اجرا نیست"
+  echo; echo "${B}== سرور ==${N}"
+  free -h | sed -n '1,3p'
+  df -h / "$DIR/data" 2>/dev/null | awk 'NR==1||!seen[$1]++'
+  echo "Load: $(cut -d' ' -f1-3 /proc/loadavg)   Uptime: $(uptime -p)"
+  echo; echo "حجم data: $(du -sh "$DIR/data" 2>/dev/null | cut -f1)   DB: $(du -sh "$DIR/data/prgram.db"* 2>/dev/null | awk '{s=s" "$1}END{print s}')"
+}
+
+cmd_start()   { dc up -d && ok "اجرا شد"; }
+cmd_stop()    { dc stop && ok "متوقف شد"; }
+cmd_restart() { dc restart && ok "ریستارت شد"; }
+cmd_logs()    { dc logs -f --tail="${1:-100}"; }
+
+cmd_adminlink() {
+  local base; base=$(envget WEB_BASE_URL); base="${base%/}"
+  local tok; tok=$(cat "$DIR/data/web_token.txt" 2>/dev/null || true)
+  if [[ -z "$tok" ]]; then warn "توکن هنوز ساخته نشده (سرویس یک‌بار باید بالا بیاید)"; return; fi
+  [[ -z "$base" ]] && base="http://$(curl -s4 --max-time 4 https://api.ipify.org || echo SERVER_IP):$(envget HOST_PORT || echo 8787)"
+  echo "${B}لینک ادمین (محرمانه، به کسی نده):${N}"
+  echo "$base/admin/panel/accounts?t=$tok"
+  [[ "$base" == http://* ]] && warn "این لینک بدون HTTPS است؛ پشت reverse proxy با TLS قرارش بده."
+}
+
+
+# ---------------- دامنه / SSL ----------------
+cmd_domain() {
+  local cur new; cur=$(envget DOMAIN)
+  echo "${B}== دامنه و HTTPS ==${N}"
+  echo "دامنه‌ی فعلی: ${cur:-ندارد}"
+  read -rp "دامنه‌ی جدید (مثلا panel.example.com | خالی = بدون تغییر | - = حذف دامنه): " new
+  [[ -z "$new" ]] && return 0
+  if [[ "$new" == "-" ]]; then
+    envset DOMAIN ""; envset WEB_BASE_URL ""; envset TRUST_PROXY 0; envset BIND_IP 0.0.0.0; envset COMPOSE_PROFILES ""
+    dc --profile domain rm -sf caddy >/dev/null 2>&1 || true
+    dc up -d --force-recreate app && ok "دامنه حذف شد؛ پنل روی IP:پورت در دسترس است"
+    return 0
+  fi
+  new=$(echo "$new" | tr 'A-Z' 'a-z' | sed -E 's#^https?://##; s#/.*$##; s#\s##g')
+  [[ "$new" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || { err "دامنه نامعتبر است"; return 1; }
+  local sip dip
+  sip=$(curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)
+  dip=$(getent ahostsv4 "$new" 2>/dev/null | awk '{print $1; exit}')
+  echo "IP سرور: ${sip:-؟}   |   رکورد A دامنه: ${dip:-پیدا نشد}"
+  if [[ -z "$dip" || ( -n "$sip" && "$dip" != "$sip" ) ]]; then
+    warn "رکورد A هنوز به این سرور اشاره نمی‌کند (Cloudflare: ابر خاکستری)."
+    ask "ادامه بدهم؟" || return 0
+  fi
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null; ufw allow 443/udp >/dev/null
+  fi
+  envset DOMAIN "$new"; envset WEB_BASE_URL "https://$new"; envset TRUST_PROXY 1
+  envset BIND_IP 127.0.0.1; envset COMPOSE_PROFILES domain
+  dc up -d --force-recreate --remove-orphans && ok "اعمال شد: https://$new"
+  echo "گواهی SSL چند ثانیه بعد صادر می‌شود. لاگ: selfpanel logs-ssl"
+}
+
+cmd_sslogs() { docker logs -f --tail=80 prgram-caddy; }
+
+# ---------------- به‌روزرسانی / بکاپ ----------------
+cmd_update() {
+  local src="${1:-}"
+  if [[ -z "$src" ]]; then read -rp "مسیر پوشه‌ی حاوی app.py جدید: " src; fi
+  [[ -f "$src/app.py" ]] || { err "$src/app.py پیدا نشد"; return 1; }
+  cmd_backup quiet
+  for f in app.py panel_ui.html requirements.txt Dockerfile docker-compose.yml Caddyfile; do
+    [[ -f "$src/$f" ]] && cp -f "$src/$f" "$DIR/$f"
+  done
+  dc up -d --build --remove-orphans && ok "به‌روزرسانی شد"
+}
+
+cmd_backup() {
+  mkdir -p "$BK"; chmod 700 "$BK"
+  local f="$BK/prgram-$(date +%Y%m%d-%H%M%S).tar.gz"
+  # checkpoint برای یکپارچگی WAL
+  docker exec "$CT" python -c "import sqlite3;c=sqlite3.connect('/app/data/prgram.db');c.execute('PRAGMA wal_checkpoint(TRUNCATE)')" 2>/dev/null || true
+  tar -czf "$f" -C "$DIR" data .env 2>/dev/null && chmod 600 "$f"
+  ok "بکاپ: $f ($(du -h "$f" | cut -f1))"
+  [[ "${1:-}" == quiet ]] || warn "این فایل شامل نشست تلگرامِ کاربران و کلید رمزنگاری است؛ فقط جای امن نگه دار."
+  ls -1t "$BK"/prgram-*.tar.gz 2>/dev/null | tail -n +8 | xargs -r rm -f   # فقط ۷ بکاپ آخر
+}
+
+cmd_restore() {
+  local f="${1:-}"
+  if [[ -z "$f" ]]; then ls -1t "$BK"/*.tar.gz 2>/dev/null | head; read -rp "مسیر فایل بکاپ: " f; fi
+  [[ -f "$f" ]] || { err "فایل نیست"; return 1; }
+  ask "داده‌ی فعلی جایگزین می‌شود. ادامه؟" || return 0
+  cmd_backup quiet
+  dc stop
+  tar -xzf "$f" -C "$DIR" && chown -R 1000:1000 "$DIR/data"
+  dc up -d && ok "بازیابی شد"
+}
+
+# ---------------- پاکسازی و بهینه‌سازی ----------------
+cmd_clean() {
+  echo "${B}== پاکسازی کش و فضای اضافی ==${N}"
+  local before; before=$(df --output=avail -B1M / | tail -1)
+  docker image prune -f >/dev/null && ok "image های بدون استفاده پاک شد"
+  docker builder prune -f >/dev/null && ok "کش build پاک شد"
+  docker container prune -f >/dev/null && ok "کانتینرهای متوقف پاک شد"
+  find "$DIR/data/logs" -name 'app.log.*' -mtime +3 -delete 2>/dev/null && ok "لاگ‌های چرخیده‌ی قدیمی پاک شد"
+  command -v journalctl >/dev/null && journalctl --vacuum-size=100M >/dev/null 2>&1 && ok "journal محدود به 100MB"
+  if command -v apt-get >/dev/null; then apt-get clean >/dev/null 2>&1 && apt-get autoremove -y >/dev/null 2>&1 && ok "کش apt پاک شد"
+  elif command -v dnf >/dev/null; then dnf clean all >/dev/null 2>&1 && ok "کش dnf پاک شد"; fi
+  rm -rf /tmp/* /var/tmp/* 2>/dev/null; ok "فایل‌های tmp پاک شد"
+  sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null && ok "page cache آزاد شد"
+  local after; after=$(df --output=avail -B1M / | tail -1)
+  echo "${G}فضای آزادشده: $((after-before)) MB${N}"
+}
+
+cmd_vacuum() {
+  warn "سرویس برای چند ثانیه متوقف می‌شود."
+  cmd_backup quiet
+  dc stop
+  local b a; b=$(du -k "$DIR/data/prgram.db" | cut -f1)
+  dc run --rm --no-deps app python -c "
+import sqlite3
+c=sqlite3.connect('/app/data/prgram.db',timeout=60)
+c.execute('DELETE FROM pg_hist WHERE ts < strftime(\"%s\",\"now\")-15*86400') if c.execute(\"select 1 from sqlite_master where name='pg_hist'\").fetchone() else None
+c.commit(); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.execute('VACUUM'); c.execute('PRAGMA optimize'); c.close()" \
+    && { a=$(du -k "$DIR/data/prgram.db" | cut -f1); ok "دیتابیس فشرده شد: ${b}KB → ${a}KB"; }
+  dc up -d
+}
+
+cmd_optimize() {
+  echo "${B}== بهینه‌سازی سرور ==${N}"
+  cat > /etc/sysctl.d/99-selfpanel.conf <<'EOF'
+# selfpanel network/memory tuning
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.somaxconn=4096
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.ip_local_port_range=10240 65535
+fs.file-max=1048576
+vm.swappiness=10
+vm.vfs_cache_pressure=80
+EOF
+  sysctl --system >/dev/null 2>&1 && ok "تنظیمات kernel (BBR، swappiness، somaxconn) اعمال شد"
+  sysctl net.ipv4.tcp_congestion_control 2>/dev/null
+  local mem_mb; mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+  if (( mem_mb < 1500 )) && ! swapon --show | grep -q .; then
+    fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile \
+      && { grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab; } && ok "swap ۱GB ساخته شد"
+  fi
+  # چرخش لاگ داکر سیستم
+  if [[ ! -f /etc/docker/daemon.json ]]; then
+    mkdir -p /etc/docker
+    echo '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}' > /etc/docker/daemon.json
+    ok "چرخش لاگ داکر تنظیم شد (با ریستارت docker اعمال می‌شود)"
+  fi
+  # ساعت دقیق (برای سقف‌های زمانی/توکن‌ها مهم است)
+  timedatectl set-ntp true >/dev/null 2>&1 && ok "NTP فعال شد"
+  ok "تمام شد"
+}
+
+cmd_limits() {
+  local m c; m=$(envget MEM_LIMIT); c=$(envget CPU_LIMIT)
+  echo "فعلی: RAM=${m:-768m}  CPU=${c:-1.5}"
+  read -rp "RAM جدید (مثلا 1g، خالی = بدون تغییر): " nm
+  read -rp "CPU جدید (مثلا 2، خالی = بدون تغییر): " nc
+  [[ -n "$nm" ]] && envset MEM_LIMIT "$nm"
+  [[ -n "$nc" ]] && envset CPU_LIMIT "$nc"
+  dc up -d && ok "اعمال شد"
+}
+
+cmd_config() {
+  echo "${B}تنظیمات (مقادیر محرمانه مخفی‌اند):${N}"
+  sed -E 's/^(BOT_TOKEN|SESSION_KEY|API_HASH)=.+/\1=********/' "$DIR/.env"
+  echo; read -rp "کلید برای تغییر (خالی = خروج): " k; [[ -z "$k" ]] && return
+  read -rp "مقدار جدید: " v; envset "$k" "$v"
+  ask "سرویس ریستارت شود؟" && dc up -d --force-recreate
+}
+
+cmd_ports() { ss -tlnp 2>/dev/null | awk 'NR==1||/:'"$(envget HOST_PORT || echo 8787)"'\b/'; }
+
+cmd_health() {
+  local p; p=$(envget HOST_PORT); p=${p:-8787}
+  if curl -fs --max-time 4 "http://127.0.0.1:$p/healthz" >/dev/null; then ok "پنل وب پاسخ می‌دهد (پورت $p)"; else err "پنل وب پاسخ نمی‌دهد"; fi
+  docker logs --tail 15 "$CT" 2>&1 | grep -Ei 'error|failed|flood' | tail -5 || true
+}
+
+cmd_uninstall() {
+  ask "سرویس حذف شود؟ (data و بکاپ‌ها می‌مانند)" || return 0
+  dc --profile domain down --rmi local
+  rm -f /usr/local/bin/selfpanel
+  ok "حذف شد. داده‌ها هنوز در $DIR/data هستند."
+}
+
+# ---------------- منو ----------------
+menu() {
+  while true; do
+    clear
+    echo "${C}${B}┌───────────────────────────────┐"
+    echo "│     PR GRAM  ·  selfpanel     │"
+    echo "└───────────────────────────────┘${N}"
+    local st; st=$(docker inspect -f '{{.State.Status}}' "$CT" 2>/dev/null || echo "نصب نشده")
+    echo "وضعیت: ${B}$st${N}   |   RAM آزاد: $(free -m | awk '/Mem/{print $7}')MB   |   دیسک آزاد: $(df -h / | awk 'NR==2{print $4}')"
+    cat <<EOF
+
+  ${B}سرویس${N}                     ${B}نگهداری${N}
+  1) وضعیت و منابع          8) بکاپ
+  2) شروع                   9) بازیابی بکاپ
+  3) توقف                  10) پاکسازی کش و فضا
+  4) ریستارت               11) فشرده‌سازی دیتابیس
+  5) لاگ زنده              12) بهینه‌سازی سرور (BBR/swap)
+  6) لینک ادمین            13) محدودیت RAM/CPU
+  7) به‌روزرسانی           14) تنظیمات .env
+                           15) تست سلامت
+                           16) دامنه و SSL
+  0) خروج                  99) حذف سرویس
+EOF
+    read -rp $'\n> ' ch
+    case "$ch" in
+      1) cmd_status; pause;; 2) cmd_start; pause;; 3) cmd_stop; pause;; 4) cmd_restart; pause;;
+      5) cmd_logs;; 6) cmd_adminlink; pause;; 7) cmd_update; pause;; 8) cmd_backup; pause;;
+      9) cmd_restore; pause;; 10) cmd_clean; pause;; 11) cmd_vacuum; pause;; 12) cmd_optimize; pause;;
+      13) cmd_limits; pause;; 14) cmd_config; pause;; 15) cmd_health; pause;; 16) cmd_domain; pause;; 99) cmd_uninstall; pause;;
+      0|q) exit 0;; *) warn "گزینه نامعتبر"; sleep 1;;
+    esac
+  done
+}
+
+case "${1:-menu}" in
+  menu) menu;;
+  status) cmd_status;; start) cmd_start;; stop) cmd_stop;; restart) cmd_restart;;
+  logs) cmd_logs "${2:-100}";; link|adminlink) cmd_adminlink;;
+  update) cmd_update "${2:-}";; backup) cmd_backup;; restore) cmd_restore "${2:-}";;
+  clean) cmd_clean;; vacuum) cmd_vacuum;; optimize) cmd_optimize;; limits) cmd_limits;;
+  config) cmd_config;; health) cmd_health;; domain) cmd_domain;; logs-ssl) cmd_sslogs;; uninstall) cmd_uninstall;;
+  *) echo "استفاده: selfpanel [status|start|stop|restart|logs|link|update|backup|restore|clean|vacuum|optimize|limits|config|health|domain|logs-ssl|uninstall]"; exit 1;;
+esac

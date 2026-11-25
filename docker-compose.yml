@@ -1,0 +1,57 @@
+services:
+  app:
+    build: .
+    image: prgram-helper:latest
+    container_name: prgram
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      WEB_PORT: "8787"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      # با دامنه: BIND_IP=127.0.0.1 (فقط از طریق Caddy/HTTPS در دسترس است)
+      # بدون دامنه: 0.0.0.0 (دسترسی مستقیم IP:پورت)
+      - "${BIND_IP:-0.0.0.0}:${HOST_PORT:-8787}:8787"
+    volumes:
+      - ./data:/app/data
+    # محدودیت منابع برای VPS کوچک (در صورت نیاز تغییر بده)
+    mem_limit: ${MEM_LIMIT:-768m}
+    cpus: ${CPU_LIMIT:-1.5}
+    ulimits:
+      nofile: 65535
+    # چرخش لاگ داکر تا دیسک پر نشه
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    stop_grace_period: 20s
+
+  # ---- reverse proxy + گواهی SSL خودکار؛ فقط وقتی COMPOSE_PROFILES=domain در .env باشد ----
+  caddy:
+    image: caddy:2-alpine
+    container_name: prgram-caddy
+    profiles: ["domain"]
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      DOMAIN: "${DOMAIN:-localhost}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # گواهی‌ها (پاک نشود تا محدودیت Let's Encrypt نخوری)
+      - caddy_config:/config
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:
