@@ -1,4 +1,4 @@
-# HTTPS خودکار (Let's Encrypt) برای دامنه‌ی تنظیم‌شده در .env  →  DOMAIN=panel.example.com
+# Automatic HTTPS (Let's Encrypt) for the domain set in .env  →  DOMAIN=panel.example.com
 {$DOMAIN} {
 	encode zstd gzip
 

@@ -4,22 +4,25 @@ services:
     image: prgram-helper:latest
     container_name: prgram
     restart: unless-stopped
+    init: true                      # reaps zombie processes and forwards stop signals properly
+    security_opt:
+      - no-new-privileges:true
     env_file: .env
     environment:
       WEB_PORT: "8787"
       PYTHONUNBUFFERED: "1"
     ports:
-      # با دامنه: BIND_IP=127.0.0.1 (فقط از طریق Caddy/HTTPS در دسترس است)
-      # بدون دامنه: 0.0.0.0 (دسترسی مستقیم IP:پورت)
+      # With a domain:    BIND_IP=127.0.0.1 (reachable only through Caddy/HTTPS)
+      # Without a domain: 0.0.0.0 (direct IP:port access)
       - "${BIND_IP:-0.0.0.0}:${HOST_PORT:-8787}:8787"
     volumes:
       - ./data:/app/data
-    # محدودیت منابع برای VPS کوچک (در صورت نیاز تغییر بده)
+    # Resource limits for a small VPS (change if needed)
     mem_limit: ${MEM_LIMIT:-768m}
     cpus: ${CPU_LIMIT:-1.5}
     ulimits:
       nofile: 65535
-    # چرخش لاگ داکر تا دیسک پر نشه
+    # Docker log rotation so the disk does not fill up
     logging:
       driver: json-file
       options:
@@ -27,7 +30,7 @@ services:
         max-file: "3"
     stop_grace_period: 20s
 
-  # ---- reverse proxy + گواهی SSL خودکار؛ فقط وقتی COMPOSE_PROFILES=domain در .env باشد ----
+  # ---- reverse proxy + automatic SSL certificate; only runs when COMPOSE_PROFILES=domain is set in .env ----
   caddy:
     image: caddy:2-alpine
     container_name: prgram-caddy
@@ -43,7 +46,7 @@ services:
       - "443:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data        # گواهی‌ها (پاک نشود تا محدودیت Let's Encrypt نخوری)
+      - caddy_data:/data        # certificates (do not delete, or you may hit Let's Encrypt rate limits)
       - caddy_config:/config
     mem_limit: 128m
     logging:
